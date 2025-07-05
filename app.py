@@ -1,16 +1,26 @@
-import streamlit as st, requests, pandas as pd, altair as alt
+# streamlit_app.py
+# ---------------------------------------------------------------
+#   Live wykres temperatur (ESP32 → Firebase RTDB)
+#   – zakresy: 1 h / dziś / 24 h / 7 dni / całość
+#   – oś X i tooltipy → czas Europe/Warsaw
+#   – auto-odświeżanie co 60 s
+# ---------------------------------------------------------------
+import streamlit as st
+import requests, pandas as pd, altair as alt, pytz
 from streamlit_autorefresh import st_autorefresh
 
-# ───── konfiguracja ─────────────────────────────────────────────
+# ───────────────────────────────────────── CONFIG ───────────────
 DB   = "https://solar-esp-rtdb-default-rtdb.europe-west1.firebasedatabase.app"
-LOGS = "/logs"           # węzeł z historią
-STAT = "/log"            # bieżący komunikat
+LOGS = "/logs"           # historia
+STAT = "/log"            # ostatni komunikat
 
-REFRESH_MS   = 60_000    # auto-odświeżanie strony co 60 s
-MAX_RECORDS  = 10_080    # 7 dni przy próbce / min
-TEMP_MIN, TEMP_MAX = -50, 100   # dopuszczalny zakres
+REFRESH_MS  = 60_000     # 60 s
+MAX_RECORDS = 10_080     # 7 dni przy próbkowaniu / min
+TEMP_MIN, TEMP_MAX = -50, 100
 
-# ───── pobieranie historii z RTDB ──────────────────────────────
+TZ = pytz.timezone("Europe/Warsaw")   # <── wybrana strefa
+
+# ───────────────────────────── pobieranie historii ──────────────
 @st.cache_data(ttl=60)
 def load_history() -> pd.DataFrame:
     url  = f"{DB}{LOGS}.json?orderBy=\"$key\"&limitToLast={MAX_RECORDS}"
@@ -21,8 +31,12 @@ def load_history() -> pd.DataFrame:
     if not df.empty and "timestamp" in df:
         ts = pd.to_numeric(df["timestamp"], errors="coerce")
         df = df.dropna(subset=["timestamp"])
-        # finalnie: datetime64[ns]  (naive UTC)
-        df["datetime"] = pd.to_datetime(ts, unit="ms", origin="unix", errors="coerce")
+        # 1) UTC aware  ➜  2) konwersja → Europe/Warsaw  ➜ 3) naive
+        df["datetime"] = (
+            pd.to_datetime(ts, unit="ms", origin="unix", utc=True)
+              .dt.tz_convert(TZ)
+              .dt.tz_localize(None)
+        )
     return df
 
 def load_status() -> str:
@@ -31,7 +45,7 @@ def load_status() -> str:
     except Exception:
         return "Brak komunikatu"
 
-# ───── UI / auto-refresh ───────────────────────────────────────
+# ─────────────────────────────── UI / autorefresh ───────────────
 st.set_page_config("ESP32 – Historia temperatur", "🌡️", layout="centered")
 st_autorefresh(interval=REFRESH_MS, key="auto")
 
@@ -44,39 +58,38 @@ if df.empty or "datetime" not in df:
     st.warning("Brak danych w RTDB.")
     st.stop()
 
-# ───── wybór zakresu czasu ─────────────────────────────────────
+# ─────────────────────────────── wybór zakresu ──────────────────
 opt = st.selectbox(
     "Zakres",
     ("Ostatnia godzina", "Dzisiejszy dzień", "24 h", "7 dni", "Całość"),
     index=2,
 )
 
-now   = pd.Timestamp.utcnow().tz_localize(None)   # UTC naive
+now   = pd.Timestamp.now(tz=TZ).tz_localize(None)
 start = None
 
 if opt == "Ostatnia godzina":
     start = now - pd.Timedelta(hours=1)
 elif opt == "Dzisiejszy dzień":
-    start = now.normalize()               # dziś 00:00 UTC
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 elif opt == "24 h":
     start = now - pd.Timedelta(hours=24)
 elif opt == "7 dni":
     start = now - pd.Timedelta(days=7)
 
-# ───── filtr danych do wybranego przedziału ────────────────────
+# ─────────────────────────── filtr + sanity check ───────────────
 df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
 df = df.dropna(subset=["datetime"])
 
 if start is not None:
     df = df[(df["datetime"] >= start) & (df["datetime"] <= now)]
 
-# ───── czyszczenie błędnych temperatur ─────────────────────────
 value_cols = [c for c in df.columns if c.startswith("t")]
 for col in value_cols:
     df[col] = pd.to_numeric(df[col], errors="coerce")
     df.loc[(df[col] < TEMP_MIN) | (df[col] > TEMP_MAX), col] = None
 
-# ───── long → Altair ───────────────────────────────────────────
+# ─────────────────────────────── Altair chart ───────────────────
 long = (
     df.melt(id_vars=["datetime"],
             value_vars=value_cols,
@@ -103,8 +116,9 @@ chart = (
            tooltip=[
                "sensor",
                alt.Tooltip("temp:Q", format=".2f", title="°C"),
-               alt.Tooltip("datetime:T", title="data, godz.",
-                format="%d-%m %H:%M"),
+               alt.Tooltip("datetime:T",
+                           title="data, godz.",
+                           format="%d-%m %H:%M"),
            ],
        )
        .interactive()
@@ -112,7 +126,7 @@ chart = (
 )
 st.altair_chart(chart, use_container_width=True)
 
-# ───── metryki ─────────────────────────────────────────────────
+# ─────────────────────────────── metryki ────────────────────────
 cols = st.columns(len(value_cols))
 for i, col in enumerate(value_cols):
     series = df[col].dropna()
@@ -123,5 +137,4 @@ for i, col in enumerate(value_cols):
         delta  = latest - series.iloc[-2] if len(series) > 1 else 0
         cols[i].metric(f"Czujnik {i}", f"{latest:.2f} °C", f"{delta:+.2f}")
 
-# ───── status ─────────────────────────────────────────────────
 st.caption(f"🛈 {status}")
