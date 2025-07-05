@@ -1,110 +1,127 @@
 import streamlit as st, requests, pandas as pd, altair as alt
 from streamlit_autorefresh import st_autorefresh
-from datetime import datetime, timedelta
 
-# --- 1. Ustawienia ----------------------------------------------------------
-DB_URL = "https://solar-esp-rtdb-default-rtdb.europe-west1.firebasedatabase.app"
-PATH   = "/sensor"             # ← zmień na /data_do_grafu gdy będzie historia
-REFRESH_MS   = 60_000          # auto-odświeżenie co 1 min
-HOURS_TO_KEEP = 48             # trzymamy max 48 h w pamięci sesji
+# ────────── konfiguracja  ────────────────────────────────────────
+DB   = "https://solar-esp-rtdb-default-rtdb.europe-west1.firebasedatabase.app"
+LOGS = "/logs"
+STAT = "/log"
 
-# --- 2. Pobranie rekordu ----------------------------------------------------
-def fetch():
-    url = f"{DB_URL}{PATH}.json"
+REFRESH_MS  = 60_000
+MAX_RECORDS = 2_880      # 48 h przy próbce / min
+TEMP_MIN, TEMP_MAX = -50, 100
+
+# ────────── pobieranie historii ─────────────────────────────────
+@st.cache_data(ttl=60)
+def load_history():
+    url  = f"{DB}{LOGS}.json?orderBy=\"$key\"&limitToLast={MAX_RECORDS}"
+    data = requests.get(url, timeout=10).json() or {}
+    rows = [v | {"_k": k} for k, v in sorted(data.items())]
+    df   = pd.DataFrame(rows)
+
+    if not df.empty and "timestamp" in df:
+        ts = pd.to_numeric(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        # → czas Warszawy, potem „naive” (bez strefy) do Pandas/Altair
+        dt = (
+            pd.to_datetime(ts, unit="ms", origin="unix", utc=True)
+              .dt.tz_convert("Europe/Warsaw")
+              .dt.tz_localize(None)
+        )
+        df["datetime"] = dt
+    return df
+
+def load_status():
     try:
-        d = requests.get(url, timeout=10).json() or {}
+        return requests.get(f"{DB}{STAT}.json", timeout=5).json()
     except Exception:
-        return None
-    if "temperature" not in d:
-        return None
+        return "Brak komunikatu"
 
-    ts_raw = d.get("timestamp", 0)
-    if ts_raw > 1e11:                          # wygląda na unix-ms
-        when = pd.to_datetime(ts_raw, unit="ms", origin="unix")
-    else:
-        when = pd.Timestamp.now()
+# ────────── UI podstawowe  ───────────────────────────────────────
+st.set_page_config("ESP32 – Historia temperatur", "🌡️", layout="centered")
+st_autorefresh(interval=REFRESH_MS, key="auto")
 
-    return {"datetime": when, "temperature": float(d["temperature"])}
+st.title("🌡️  Live wykres temperatury (3 czujniki)")
 
-# --- 3. Konfiguracja strony --------------------------------------------------
-st.set_page_config("Live temperatura", "🌡️", layout="centered")
-st.title("🌡️  Live wykres temperatury")
-st_autorefresh(interval=REFRESH_MS, key="autorefresh")
+df     = load_history()
+status = load_status()
 
-# --- 4. Historia w session_state -------------------------------------------
-hist = st.session_state.get(
-    "hist", pd.DataFrame(columns=["temperature","datetime"])
-)
-
-row = fetch()
-if row:
-    row_df = pd.DataFrame([row])
-
-    # ►►  NOWY, „bez-warningowy” sposób dokładania wierszy  ◄◄
-    if hist.empty:
-        hist = row_df                        # pierwszy wpis
-    else:
-        hist = pd.concat([hist, row_df], ignore_index=True)
-
-    # przytnij do HOURS_TO_KEEP
-    cutoff = pd.Timestamp.now() - pd.Timedelta(hours=HOURS_TO_KEEP)
-    hist = hist[hist["datetime"] >= cutoff]
-
-    st.session_state.hist = hist
-
-if hist.empty:
+if df.empty or "datetime" not in df:
     st.warning("Brak danych w RTDB.")
     st.stop()
 
-# --- 5. Wybór przedziału do wyświetlenia ------------------------------------
-option = st.selectbox(
+# ────────── wybór zakresu  ───────────────────────────────────────
+opt = st.selectbox(
     "Zakres",
-    ("Ostatnia godzina", "24 h", "Całość"),
-    index=2,
-    help="Filtruje dane przed narysowaniem wykresu",
+    ("Ostatnia godzina", "Dzisiejszy dzień", "24 h", "7 dni", "Całość"),
+    index=2
 )
 
-now = pd.Timestamp.now()
-if option == "Ostatnia godzina":
-    df = hist[hist["datetime"] >= now - pd.Timedelta(hours=1)]
-elif option == "Dzisiejszy dzień":
-    df = hist[hist["datetime"].dt.date == now.date()]
-elif option == "24 h":
-    df = hist[hist["datetime"] >= now - pd.Timedelta(hours=24)]
-else:
-    df = hist.copy()
+now   = pd.Timestamp.now()               # „naive” => zgodny z kolumną
+start = None                             # granica lewa do osi X
 
-if df.empty:
+if opt == "Ostatnia godzina":
+    start = now - pd.Timedelta(hours=1)
+elif opt == "Dzisiejszy dzień":
+    start = now.normalize()              # dziś 00:00
+elif opt == "24 h":
+    start = now - pd.Timedelta(hours=24)
+elif opt == "7 dni":
+    start = now - pd.Timedelta(days=7)
+
+# filtr danych (jeżeli start zdefiniowany)
+if start is not None:
+    df = df[(df["datetime"] >= start) & (df["datetime"] <= now)]
+
+# ────────── czyszczenie błędnych temperatur  ─────────────────────
+value_cols = [c for c in df.columns if c.startswith("t")]
+for col in value_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.loc[(df[col] < TEMP_MIN) | (df[col] > TEMP_MAX), col] = None
+
+# ────────── long format  ─────────────────────────────────────────
+long = (
+    df.melt(id_vars=["datetime"],
+            value_vars=value_cols,
+            var_name="sensor",
+            value_name="temp")
+      .dropna(subset=["temp"])
+)
+
+if long.empty:
     st.info("Brak danych w wybranym zakresie.")
     st.stop()
 
-# --- 6. Wykres Altair -------------------------------------------------------
+# ────────── wykres Altair  ───────────────────────────────────────
+x_scale = alt.Scale(domain=[start, now]) if start is not None else alt.Undefined
+
 chart = (
-    alt.Chart(df)
+    alt.Chart(long)
        .mark_line(point=True)
        .encode(
-           x=alt.X("datetime:T", axis=alt.Axis(title="czas", format="%H:%M")),
-           y=alt.Y("temperature:Q", axis=alt.Axis(title="°C")),
-           tooltip=[
-               alt.Tooltip("temperature:Q",
-                           title="Temperatura (°C)",
-                           format=".2f"),
-               alt.Tooltip("datetime:T",
-                           title="Czas",
-                           format="%d-%m %H:%M")
-           ]
+           x=alt.X("datetime:T",
+                   scale=x_scale,
+                   axis=alt.Axis(title="czas", format="%d-%m %H:%M")),
+           y=alt.Y("temp:Q", axis=alt.Axis(title="°C")),
+           color="sensor:N",
+           tooltip=["sensor",
+                    alt.Tooltip("temp:Q", format=".2f", title="°C"),
+                    alt.Tooltip("datetime:T", title="czas")]
        )
        .interactive()
-       .properties(height=400)
+       .properties(height=450)
 )
 st.altair_chart(chart, use_container_width=True)
 
-# --- 7. Panele metryk -------------------------------------------------------
-last = df.iloc[-1]
-prev = df.iloc[-2] if len(df) > 1 else last
-st.metric(
-    "Ostatnia wartość",
-    f"{last.temperature:.2f} °C",
-    f"{last.temperature - prev.temperature:+.2f} °C",
-    help=last.datetime.strftime("%Y-%m-%d %H:%M:%S"),
-)
+# ────────── metryki  ─────────────────────────────────────────────
+cols = st.columns(len(value_cols))
+for i, col in enumerate(value_cols):
+    series = df[col].dropna()
+    if series.empty:
+        cols[i].metric(f"Czujnik {i}", "Brak danych")
+    else:
+        latest = series.iloc[-1]
+        delta  = latest - series.iloc[-2] if len(series) > 1 else 0
+        cols[i].metric(f"Czujnik {i}", f"{latest:.2f} °C", f"{delta:+.2f}")
+
+# ────────── status / log  ────────────────────────────────────────
+st.caption(f"🛈 {status}")
