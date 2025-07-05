@@ -103,7 +103,8 @@ chart = (
            tooltip=[
                "sensor",
                alt.Tooltip("temp:Q", format=".2f", title="°C"),
-               alt.Tooltip("datetime:T", title="czas"),
+               alt.Tooltip("datetime:T", title="data, godz.",
+                format="%d-%m %H:%M"),
            ],
        )
        .interactive()
