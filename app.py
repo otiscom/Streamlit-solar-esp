@@ -24,7 +24,6 @@ def load_history():
         # → czas Warszawy, potem „naive” (bez strefy) do Pandas/Altair
         dt = (
             pd.to_datetime(ts, unit="ms", origin="unix", utc=True)
-              .dt.tz_convert("Europe/Warsaw")
               .dt.tz_localize(None)
         )
         df["datetime"] = dt
@@ -56,7 +55,7 @@ opt = st.selectbox(
     index=2
 )
 
-now   = pd.Timestamp.now()               # „naive” => zgodny z kolumną
+now = pd.Timestamp.utcnow()
 start = None                             # granica lewa do osi X
 
 if opt == "Ostatnia godzina":
