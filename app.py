@@ -61,7 +61,7 @@ if df.empty or "datetime" not in df:
 # ─────────────────────────────── wybór zakresu ──────────────────
 opt = st.selectbox(
     "Zakres",
-    ("Ostatnia godzina", "Dzisiejszy dzień", "24 h", "7 dni", "Całość"),
+    ("Ostatnia godzina", "Dzisiaj", "24 h", "7 dni", "Całość"),
     index=2,
 )
 
