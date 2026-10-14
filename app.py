@@ -1,140 +1,243 @@
-# streamlit_app.py
-# ---------------------------------------------------------------
-#   Live wykres temperatur (ESP32 → Firebase RTDB)
-#   – zakresy: 1 h / dziś / 24 h / 7 dni / całość
-#   – oś X i tooltipy → czas Europe/Warsaw
-#   – auto-odświeżanie co 60 s
-# ---------------------------------------------------------------
+"""ESP32 -> Firebase RTDB: historia temperatur i biezace odczyty.
+
+Zgodne z dotychczasowymi rekordami oraz szkicem MonitorWody v2.1.
+Zakresy liczymy w UTC; daty wyswietlamy zawsze w Europe/Warsaw.
+"""
+import json
+
+import altair as alt
+import pandas as pd
+import requests
 import streamlit as st
-import requests, pandas as pd, altair as alt, pytz
 from streamlit_autorefresh import st_autorefresh
 
-# ───────────────────────────────────────── CONFIG ───────────────
-DB   = "https://solar-esp-rtdb-default-rtdb.europe-west1.firebasedatabase.app"
-LOGS = "/logs"           # historia
-STAT = "/log"            # ostatni komunikat
+DB = "https://solar-esp-rtdb-default-rtdb.europe-west1.firebasedatabase.app"
+LOGS, STAT = "/logs", "/log"
+TZ = "Europe/Warsaw"
+REFRESH_MS = 60_000
+STALE_MINUTES = 3  # normalny pomiar ESP co minute
+GAP_MS = 3 * 60_000
+MAX_CHART_POINTS = 10_000
+HISTORY_LIMIT = 10_000
+TEMP_MIN, TEMP_MAX = -55, 125
+SENSOR_COLUMNS = ("t0", "t1")
+RANGES = ("Ostatnia godzina", "Dzisiaj", "24 h", "7 dni", "Ostatnie 10 000 pomiarów")
 
-REFRESH_MS  = 60_000     # 60 s
-MAX_RECORDS = 10_080     # 7 dni przy próbkowaniu / min
-TEMP_MIN, TEMP_MAX = -50, 100
 
-TZ = pytz.timezone("Europe/Warsaw")   # <── wybrana strefa
+class MissingIndexError(RuntimeError):
+    pass
 
-# ───────────────────────────── pobieranie historii ──────────────
-@st.cache_data(ttl=60)
-def load_history() -> pd.DataFrame:
-    url  = f"{DB}{LOGS}.json?orderBy=\"$key\"&limitToLast={MAX_RECORDS}"
-    data = requests.get(url, timeout=10).json() or {}
-    rows = [v | {"_key": k} for k, v in sorted(data.items())]
-    df   = pd.DataFrame(rows)
 
-    if not df.empty and "timestamp" in df:
-        ts = pd.to_numeric(df["timestamp"], errors="coerce")
-        df = df.dropna(subset=["timestamp"])
-        # 1) UTC aware  ➜  2) konwersja → Europe/Warsaw  ➜ 3) naive
-        df["datetime"] = (
-            pd.to_datetime(ts, unit="ms", origin="unix", utc=True)
-              .dt.tz_convert(TZ)
-              .dt.tz_localize(None)
-        )
-    return df
+def fetch_json(path, params=None):
+    response = requests.get(f"{DB}{path}.json", params=params, timeout=(5, 25))
+    # Indeks timestamp pozwala pobierac tylko potrzebne dane.
+    if response.status_code == 400:
+        try:
+            message = str(response.json().get("error", ""))
+        except (ValueError, AttributeError):
+            message = ""
+        if "index" in message.lower():
+            raise MissingIndexError(message)
+    response.raise_for_status()
+    data = response.json()
+    if isinstance(data, dict) and "error" in data:
+        raise ValueError(str(data["error"]))
+    return data
 
-def load_status() -> str:
+
+def normalize_records(data):
+    if not isinstance(data, dict):
+        raise ValueError("Nieprawidłowy format historii w bazie.")
+    allowed = ("timestamp", "t0", "t1")
+    rows = [dict({name: value[name] for name in allowed if name in value}, _key=str(key))
+            for key, value in data.items()
+            if isinstance(value, dict)]
+    df = pd.DataFrame(rows)
+    if df.empty or "timestamp" not in df:
+        return pd.DataFrame(columns=["_key", "timestamp", "datetime"])
+    ts = pd.to_numeric(df["timestamp"], errors="coerce")
+    df["datetime"] = pd.to_datetime(ts, unit="ms", utc=True, errors="coerce")
+    # Chroni przed np. millis() zamiast Unix ms i uszkodzonymi datami.
+    df = df.loc[df["datetime"].notna() & (ts >= 1_577_836_800_000)].copy()
+    df["timestamp"] = ts.loc[df.index].astype("int64")
+    for sensor in SENSOR_COLUMNS:
+        if sensor in df:
+            values = pd.to_numeric(df[sensor], errors="coerce")
+            df[sensor] = values.where(values.between(TEMP_MIN, TEMP_MAX))
+    return df.sort_values(["timestamp", "_key"], kind="stable").reset_index(drop=True)
+
+
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False)
+def load_history(start_ms=None, end_ms=None):
+    if start_ms is None:
+        return normalize_records(fetch_json(LOGS, {"orderBy": json.dumps("timestamp"),
+                                                   "limitToLast": HISTORY_LIMIT}) or {})
+    params = {"orderBy": json.dumps("timestamp"), "startAt": start_ms}
+    if end_ms is not None:
+        params["endAt"] = end_ms
+    data = fetch_json(LOGS, params)
+    return normalize_records(data or {})
+
+
+@st.cache_data(ttl=60, max_entries=1, show_spinner=False)
+def load_recent():
+    data = fetch_json(LOGS, {"orderBy": json.dumps("timestamp"), "limitToLast": 10})
+    return normalize_records(data or {})
+
+
+def load_status():
     try:
-        return requests.get(f"{DB}{STAT}.json", timeout=5).json()
-    except Exception:
-        return "Brak komunikatu"
+        value = fetch_json(STAT)
+        return value if isinstance(value, str) else "Brak komunikatu z urządzenia"
+    except (requests.RequestException, ValueError, MissingIndexError):
+        return "Nie udało się pobrać komunikatu z urządzenia"
 
-# ─────────────────────────────── UI / autorefresh ───────────────
-st.set_page_config("ESP32 – Historia temperatur", "🌡️", layout="centered")
-st_autorefresh(interval=REFRESH_MS, key="auto")
 
-st.title("🌡️  Live wykres temperatury (3 czujniki)")
+def range_start(option, now):
+    """now ma strefe UTC; dzis oznacza polnoc w Warszawie, takze przy zmianie czasu."""
+    if option in ("Dzisiaj", "Dzisiejszy dzień"):
+        return now.tz_convert(TZ).normalize().tz_convert("UTC")
+    durations = {"Ostatnia godzina": pd.Timedelta(hours=1),
+                 "24 h": pd.Timedelta(hours=24), "7 dni": pd.Timedelta(days=7)}
+    return now - durations[option] if option in durations else None
 
-df     = load_history()
-status = load_status()
 
-if df.empty or "datetime" not in df:
-    st.warning("Brak danych w RTDB.")
-    st.stop()
+def filter_history(df, start, now):
+    mask = df["datetime"] <= now
+    if start is not None:
+        mask &= df["datetime"] >= start
+    return df.loc[mask].copy()
 
-# ─────────────────────────────── wybór zakresu ──────────────────
-opt = st.selectbox(
-    "Zakres",
-    ("Ostatnia godzina", "Dzisiaj", "24 h", "7 dni", "Całość"),
-    index=2,
-)
 
-now   = pd.Timestamp.now(tz=TZ).tz_localize(None)
-start = None
+def sensor_columns(df):
+    # Dokladna lista: timestamp, receivedAt ani inne metadane nie sa czujnikami.
+    return [name for name in SENSOR_COLUMNS if name in df.columns]
 
-if opt == "Ostatnia godzina":
-    start = now - pd.Timedelta(hours=1)
-elif opt == "Dzisiejszy dzień":
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-elif opt == "24 h":
-    start = now - pd.Timedelta(hours=24)
-elif opt == "7 dni":
-    start = now - pd.Timedelta(days=7)
 
-# ─────────────────────────── filtr + sanity check ───────────────
-df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-df = df.dropna(subset=["datetime"])
+def chart_data(df):
+    sensors = sensor_columns(df)
+    if df.empty or not sensors:
+        return pd.DataFrame()
+    long = df.melt(id_vars=["timestamp", "datetime"], value_vars=sensors,
+                   var_name="sensor", value_name="temp")
+    long = long.sort_values(["sensor", "timestamp"], kind="stable").reset_index(drop=True)
+    grouped = long.groupby("sensor", sort=False)
+    previous_missing = grouped["temp"].shift().isna()
+    gap = grouped["timestamp"].diff().gt(GAP_MS)
+    # Segmenty tworzymy PRZED usunieciem blednych odczytow.
+    long["break"] = long["temp"].isna() | previous_missing | gap
+    long["segment"] = long.groupby("sensor", sort=False)["break"].cumsum()
+    long = long.dropna(subset=["temp"]).copy()
+    long["displayTime"] = long["datetime"].dt.tz_convert(TZ).dt.strftime("%d-%m-%Y %H:%M:%S %Z")
+    return long
 
-if start is not None:
-    df = df[(df["datetime"] >= start) & (df["datetime"] <= now)]
 
-value_cols = [c for c in df.columns if c.startswith("t")]
-for col in value_cols:
-    df[col] = pd.to_numeric(df[col], errors="coerce")
-    df.loc[(df[col] < TEMP_MIN) | (df[col] > TEMP_MAX), col] = None
+def reduce_chart_data(long):
+    """Dla duzych zakresow zachowaj ekstrema i konce segmentow zamiast calego JSON wykresu."""
+    if len(long) <= MAX_CHART_POINTS:
+        return long
+    data = long.copy()
+    low, high = int(data["timestamp"].min()), int(data["timestamp"].max())
+    buckets = max(1, MAX_CHART_POINTS // (2 * data["sensor"].nunique()))
+    data["bucket"] = ((data["timestamp"] - low) * (buckets - 1) // max(1, high - low)).astype(int)
+    groups = data.groupby(["sensor", "segment", "bucket"], sort=False)["temp"]
+    indices = set(groups.idxmin()) | set(groups.idxmax())
+    for _, segment in data.groupby(["sensor", "segment"], sort=False):
+        indices.update([segment.index[0], segment.index[-1]])
+    return data.loc[sorted(indices)].drop(columns=["bucket"])
 
-# ─────────────────────────────── Altair chart ───────────────────
-long = (
-    df.melt(id_vars=["datetime"],
-            value_vars=value_cols,
-            var_name="sensor",
-            value_name="temp")
-      .dropna(subset=["temp"])
-)
 
-if long.empty:
-    st.info("Brak danych w wybranym zakresie.")
-    st.stop()
+def make_chart(long, start, now):
+    low = int(start.timestamp() * 1000) if start is not None else int(long["timestamp"].min())
+    high = int(now.timestamp() * 1000) if start is not None else int(long["timestamp"].max())
+    if low == high:
+        low -= 60_000
+        high += 60_000
+    ticks = sorted({int(low + (high - low) * i / 7) for i in range(8)})
+    labels = {str(t): pd.Timestamp(t, unit="ms", tz="UTC").tz_convert(TZ).strftime("%d-%m %H:%M")
+              for t in ticks}
+    # Numeryczna os czasu z jawnymi etykietami Warszawy: niezalezna od strefy przegladarki.
+    axis = alt.Axis(title="czas", values=ticks, labelAngle=0,
+                    labelExpr=f"({json.dumps(labels)})[format(datum.value, '.0f')]")
+    base = alt.Chart(long).encode(
+        x=alt.X("timestamp:Q", scale=alt.Scale(domain=[low, high], zero=False), axis=axis),
+        y=alt.Y("temp:Q", axis=alt.Axis(title="°C")),
+        color=alt.Color("sensor:N", title="sensor"),
+        tooltip=[alt.Tooltip("sensor:N", title="Czujnik"),
+                 alt.Tooltip("temp:Q", format=".2f", title="°C"),
+                 alt.Tooltip("displayTime:N", title="Data i godzina")],
+    )
+    return base.mark_line(point=True).encode(detail="segment:N", order="timestamp:Q").interactive().properties(height=450)
 
-x_scale = alt.Scale(domain=[start, now]) if start is not None else alt.Undefined
 
-chart = (
-    alt.Chart(long)
-       .mark_line(point=True)
-       .encode(
-           x=alt.X("datetime:T",
-                   scale=x_scale,
-                   axis=alt.Axis(title="czas", format="%d-%m %H:%M")),
-           y=alt.Y("temp:Q", axis=alt.Axis(title="°C")),
-           color="sensor:N",
-           tooltip=[
-               "sensor",
-               alt.Tooltip("temp:Q", format=".2f", title="°C"),
-               alt.Tooltip("datetime:T",
-                           title="data, godz.",
-                           format="%d-%m %H:%M"),
-           ],
-       )
-       .interactive()
-       .properties(height=450)
-)
-st.altair_chart(chart, use_container_width=True)
+def show_metrics(recent, now):
+    sensors = sensor_columns(recent)
+    if not sensors:
+        st.info("Brak poprawnych odczytów czujników.")
+        return
+    columns = st.columns(len(sensors))
+    for column, sensor in zip(columns, sensors):
+        good = recent.loc[recent[sensor].notna()]
+        name = f"Czujnik {int(sensor[1:]) + 1}"
+        if good.empty:
+            column.metric(name, "Brak danych")
+            continue
+        latest = good.iloc[-1]
+        delta = float(latest[sensor] - good.iloc[-2][sensor]) if len(good) > 1 else None
+        column.metric(name, f"{latest[sensor]:.2f} °C", None if delta is None else f"{delta:+.2f}")
+        age = max(0, int((now - latest["datetime"]).total_seconds() / 60))
+        stamp = latest["datetime"].tz_convert(TZ).strftime("%d-%m %H:%M")
+        column.caption(f"Ostatni poprawny pomiar: {stamp} · {age} min temu")
+        if age > STALE_MINUTES:
+            column.warning("Odczyt nieaktualny")
+        elif pd.isna(recent.iloc[-1][sensor]):
+            column.warning("Brak poprawnego odczytu w ostatniej próbce")
 
-# ─────────────────────────────── metryki ────────────────────────
-cols = st.columns(len(value_cols))
-for i, col in enumerate(value_cols):
-    series = df[col].dropna()
-    if series.empty:
-        cols[i].metric(f"Czujnik {i}", "Brak danych")
+
+def main():
+    st.set_page_config("ESP32 – Historia temperatur", "🌡️", layout="centered")
+    st_autorefresh(interval=REFRESH_MS, key="auto")
+    st.title("🌡️  Live wykres temperatury")
+    option = st.selectbox("Zakres", RANGES, index=2)
+    now = pd.Timestamp.now(tz="UTC")
+    start = range_start(option, now)
+    # Historie odswiezamy co 5 min, 10 najnowszych rekordow co minute.
+    # Najnowsze probki dolaczamy do wykresu bez ponownego pobierania calego zakresu.
+    query_start = int(start.floor("5min").timestamp() * 1000) if start is not None else None
+    query_end = int(now.ceil("5min").timestamp() * 1000)
+    try:
+        with st.spinner("Pobieranie temperatur…"):
+            history = load_history(query_start, query_end)
+            recent = filter_history(load_recent(), None, now)
+    except MissingIndexError:
+        st.error("Dodaj indeks timestamp w regułach Firebase według instrukcji wdrożenia.")
+        st.stop()
+        return
+    except (requests.RequestException, ValueError, MissingIndexError):
+        st.error("Nie udało się pobrać historii temperatur. Sprawdź połączenie i dostęp do bazy.")
+        st.stop()
+        return
+    history = (pd.concat([history, recent], ignore_index=True)
+               .drop_duplicates("_key", keep="last")
+               .sort_values(["timestamp", "_key"], kind="stable"))
+    if start is None:
+        history = history.tail(HISTORY_LIMIT)
+    visible = filter_history(history, start, now)
+    long = chart_data(visible)
+    if long.empty:
+        st.info("Brak pomiarów w wybranym zakresie. Zakres jest liczony od bieżącego czasu.")
     else:
-        latest = series.iloc[-1]
-        delta  = latest - series.iloc[-2] if len(series) > 1 else 0
-        cols[i].metric(f"Czujnik {i}", f"{latest:.2f} °C", f"{delta:+.2f}")
+        plot = reduce_chart_data(long)
+        # Nie ma bledu Altair przy wiecej niz 5000 wierszy.
+        # Ograniczenie wielkosci wykresu jest realizowane jawnie powyzej.
+        with alt.data_transformers.disable_max_rows():
+            st.altair_chart(make_chart(plot, start, now), use_container_width=True)
+        if len(plot) < len(long):
+            st.caption("Dla dużego zakresu wykres uproszczono z zachowaniem minimów, maksimów i przerw.")
+    # Kafelki sa niezalezne od filtra historii i kolejnosci dosylania rekordow.
+    show_metrics(recent, now)
+    st.caption(f"🛈 {load_status()}")
 
-st.caption(f"🛈 {status}")
+
+if __name__ == "__main__":
+    main()
